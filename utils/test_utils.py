@@ -8,8 +8,9 @@ from utils.pkl_utils import save_pkl
 from metrics.metrics_sets import run_metrics, calculate_one
 from ldm.data.tsg_dataset import TSGDataset
 import os
+from utils.data_utils import get_data_root
 
-data_root = os.environ['DATA_ROOT']
+data_root = str(get_data_root())
 
 def test_model_with_dp(model, data, trainer, opt, logdir):
     if trainer.callbacks[-1].best_model_path:

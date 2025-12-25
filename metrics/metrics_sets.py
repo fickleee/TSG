@@ -3,11 +3,10 @@
 
 import os
 import numpy as np
-from utils.data_utils import test_data_loading
+from utils.data_utils import test_data_loading, get_data_root
 from metrics.feature_distance_eval import get_mdd_eval, mmd_metric, get_flat_distance
 
-
-data_root = os.environ['DATA_ROOT']
+data_root = str(get_data_root())
 
 
 def calculate_one(gen_data, scaled_ori, model_name, repeat, data_name, seq_len, uni_data_sub, uni_data_div, n_samples):

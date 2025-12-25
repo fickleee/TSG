@@ -11,8 +11,9 @@ from sklearn.manifold import TSNE
 from ldm.data.tsg_dataset import TSGDataset
 from utils.init_utils import load_model_data
 from utils.cli_utils import get_parser
+from utils.data_utils import get_data_root
 
-data_root = os.environ['DATA_ROOT']
+data_root = str(get_data_root())
 
 mix_dataset = [
         'electricity', 'solar', 'wind_4_seconds', 'traffic', 'taxi', 'pedestrian', 

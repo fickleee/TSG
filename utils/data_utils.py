@@ -9,11 +9,36 @@ from datetime import datetime
 from pathlib import Path
 import os
 
-prefix = ''
-if 'DATA_ROOT' in os.environ and os.path.exists(os.environ['DATA_ROOT']):
-    prefix = Path(os.environ['DATA_ROOT'])
-else:
-    print("DATA_ROOT not exist or not defined!")
+def get_data_root():
+    """
+    获取数据根目录路径（统一函数，可在所有模块中导入使用）
+    优先级：
+    1. 环境变量 DATA_ROOT（如果设置且存在）
+    2. 项目根目录下的 dataset 文件夹（默认）
+    
+    Returns:
+        Path: 数据根目录的Path对象
+    """
+    # 首先检查环境变量
+    if 'DATA_ROOT' in os.environ and os.path.exists(os.environ['DATA_ROOT']):
+        return Path(os.environ['DATA_ROOT'])
+    
+    # 如果没有设置环境变量，使用项目根目录下的dataset文件夹
+    # 获取当前文件的目录，向上找到项目根目录
+    current_file = Path(__file__).resolve()
+    # utils/data_utils.py -> 项目根目录
+    project_root = current_file.parent.parent
+    default_data_root = project_root / 'dataset'
+    
+    if default_data_root.exists():
+        print(f"使用默认数据目录: {default_data_root}")
+        return default_data_root
+    else:
+        print(f"警告: 默认数据目录不存在: {default_data_root}")
+        print("请设置 DATA_ROOT 环境变量或确保 dataset 文件夹存在")
+        return default_data_root  # 仍然返回，让后续代码处理错误
+
+prefix = get_data_root()
 
 test_data_map = {
     'solar': 'solar_{seq_len}_val.npy',

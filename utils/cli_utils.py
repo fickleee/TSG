@@ -36,7 +36,13 @@ def get_parser(**parser_kwargs):
     parser.add_argument("--use_gnn", type=str2bool, nargs="?", const=True, default=False, help="use GNN for multi-variable interaction in PAM")
     parser.add_argument("--num_variables", type=int, default=None, help="number of variables for GNN (required if use_gnn=True)")
     parser.add_argument("--gnn_layers", type=int, default=2, help="number of GNN layers")
-    parser.add_argument("--gnn_type", type=str, default="simple_gcn", choices=["simple_gcn", "gcn", "gat"], help="GNN type: simple_gcn (no deps), gcn/gat (requires PyTorch Geometric)")
+    parser.add_argument("--gnn_type", type=str, default="simple_gcn", choices=["simple_gcn", "gcn", "gat", "gatv2"], help="GNN type: simple_gcn (no deps), gcn/gat/gatv2 (requires PyTorch Geometric)")
+    # UNet Bottleneck GNN相关参数
+    parser.add_argument("--use_gnn_in_unet", type=str2bool, nargs="?", const=True, default=False, help="use GNN in UNet Bottleneck layer")
+    parser.add_argument("--unet_gnn_type", type=str, default="gat", choices=["simple_gcn", "gcn", "gat", "gatv2"], help="UNet GNN type: simple_gcn (no deps), gcn/gat/gatv2 (requires PyTorch Geometric)")
+    parser.add_argument("--unet_gnn_layers", type=int, default=2, help="number of UNet GNN layers")
+    parser.add_argument("--unet_gnn_hidden_dim", type=int, default=None, help="UNet GNN hidden dimension (None uses channels)")
+    parser.add_argument("--unet_gnn_heads", type=int, default=4, help="number of attention heads for GAT in UNet")
     
     return parser
 

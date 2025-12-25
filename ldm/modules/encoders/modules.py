@@ -194,7 +194,7 @@ class DomainUnifiedPrototyper(nn.Module):
             else:
                 # 尝试使用PyTorch Geometric（如果可用）
                 try:
-                    from torch_geometric.nn import GCNConv, GATConv
+                    from torch_geometric.nn import GCNConv, GATConv, GATv2Conv
                     if gnn_type == 'gcn':
                         self.gnn_layers = nn.ModuleList([
                             GCNConv(num_latents if i == 0 else gnn_hidden_dim,
@@ -206,6 +206,13 @@ class DomainUnifiedPrototyper(nn.Module):
                             GATConv(num_latents if i == 0 else gnn_hidden_dim,
                                    num_latents if i == gnn_layers - 1 else gnn_hidden_dim,
                                    heads=4, concat=False)
+                            for i in range(gnn_layers)
+                        ])
+                    elif gnn_type == 'gatv2':
+                        self.gnn_layers = nn.ModuleList([
+                            GATv2Conv(num_latents if i == 0 else gnn_hidden_dim,
+                                     num_latents if i == gnn_layers - 1 else gnn_hidden_dim,
+                                     heads=4, concat=False)
                             for i in range(gnn_layers)
                         ])
                     else:

@@ -6,6 +6,7 @@ import math
 
 import numpy as np
 import torch as th
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat
@@ -57,12 +58,15 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None, mask=None):
+    def forward(self, x, emb, context=None, mask=None, data_key=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, Spatial1DTransformer):
                 x = layer(x, context, mask=mask)
+            elif isinstance(layer, GNNBlock):
+                # GNNBlock需要data_key来查找变量数
+                x = layer(x, data_key=data_key)
             else:
                 x = layer(x)
         return x
@@ -383,6 +387,241 @@ class QKVAttention(nn.Module):
         return count_flops_attn(model, _x, y)
 
 
+class GNNBlock(nn.Module):
+    """
+    在UNet Bottleneck层使用的GNN模块，用于处理变量间的交互
+    输入输出形状保持一致，可以无缝插入到middle_block中
+    """
+    def __init__(self, channels, gnn_type='gat', gnn_layers=2, 
+                 gnn_hidden_dim=None, num_heads=4, use_checkpoint=False,
+                 num_variables_dict=None):
+        super().__init__()
+        self.channels = channels
+        self.gnn_type = gnn_type
+        self.use_checkpoint = use_checkpoint
+        self.num_variables_dict = num_variables_dict or {}  # {data_key: num_variables}
+        gnn_hidden_dim = gnn_hidden_dim or channels
+        
+        # 初始化GNN层（复用PAM中的实现逻辑）
+        if gnn_type == 'simple_gcn':
+            from ldm.modules.encoders.modules import SimpleGCNLayer
+            self.gnn_layers = nn.ModuleList([
+                SimpleGCNLayer(channels if i == 0 else gnn_hidden_dim,
+                              channels if i == gnn_layers - 1 else gnn_hidden_dim)
+                for i in range(gnn_layers)
+            ])
+        else:
+            try:
+                from torch_geometric.nn import GCNConv, GATConv, GATv2Conv
+                if gnn_type == 'gcn':
+                    self.gnn_layers = nn.ModuleList([
+                        GCNConv(channels if i == 0 else gnn_hidden_dim,
+                               channels if i == gnn_layers - 1 else gnn_hidden_dim)
+                        for i in range(gnn_layers)
+                    ])
+                elif gnn_type == 'gat':
+                    self.gnn_layers = nn.ModuleList([
+                        GATConv(channels if i == 0 else gnn_hidden_dim,
+                               channels if i == gnn_layers - 1 else gnn_hidden_dim,
+                               heads=num_heads, concat=False)
+                        for i in range(gnn_layers)
+                    ])
+                elif gnn_type == 'gatv2':
+                    self.gnn_layers = nn.ModuleList([
+                        GATv2Conv(channels if i == 0 else gnn_hidden_dim,
+                                 channels if i == gnn_layers - 1 else gnn_hidden_dim,
+                                 heads=num_heads, concat=False)
+                        for i in range(gnn_layers)
+                    ])
+                else:
+                    raise ValueError(f"Unknown GNN type: {gnn_type}")
+            except ImportError:
+                print("Warning: PyTorch Geometric not available. Falling back to simple_gcn.")
+                from ldm.modules.encoders.modules import SimpleGCNLayer
+                self.gnn_layers = nn.ModuleList([
+                    SimpleGCNLayer(channels if i == 0 else gnn_hidden_dim,
+                                  channels if i == gnn_layers - 1 else gnn_hidden_dim)
+                    for i in range(gnn_layers)
+                ])
+        
+        # 【必须加】零初始化最后一层GNN层，防止破坏UNet已学到的特征
+        if len(self.gnn_layers) > 0:
+            self._zero_init_last_layer()
+    
+    def _zero_init_last_layer(self):
+        """零初始化最后一层GNN层，确保训练初期GNN输出接近0"""
+        last_layer = self.gnn_layers[-1]
+        
+        if self.gnn_type == 'simple_gcn':
+            # SimpleGCNLayer有weight和bias属性
+            nn.init.zeros_(last_layer.weight)
+            if last_layer.bias is not None:
+                nn.init.zeros_(last_layer.bias)
+        else:
+            # PyTorch Geometric的层
+            # GCNConv使用lin属性
+            if hasattr(last_layer, 'lin'):
+                nn.init.zeros_(last_layer.lin.weight)
+                if last_layer.lin.bias is not None:
+                    nn.init.zeros_(last_layer.lin.bias)
+            # GATConv和GATv2Conv可能使用lin_src和lin_dst
+            elif hasattr(last_layer, 'lin_src'):
+                nn.init.zeros_(last_layer.lin_src.weight)
+                if last_layer.lin_src.bias is not None:
+                    nn.init.zeros_(last_layer.lin_src.bias)
+                if hasattr(last_layer, 'lin_dst'):
+                    nn.init.zeros_(last_layer.lin_dst.weight)
+                    if last_layer.lin_dst.bias is not None:
+                        nn.init.zeros_(last_layer.lin_dst.bias)
+            # 如果都没有，尝试直接访问weight和bias
+            elif hasattr(last_layer, 'weight'):
+                nn.init.zeros_(last_layer.weight)
+                if hasattr(last_layer, 'bias') and last_layer.bias is not None:
+                    nn.init.zeros_(last_layer.bias)
+    
+    def _build_edge_index(self, num_nodes, num_samples, num_timesteps, device):
+        """
+        构建边索引：每个时间步独立构建全连接图
+        使用向量化操作，大幅提升性能并允许中断
+        Args:
+            num_nodes: 变量数
+            num_samples: 样本数（N，不是B）
+            num_timesteps: 时间步数
+        Returns:
+            edge_index: (2, num_edges) 边索引
+        """
+        # 如果只有1个节点，无法构建边
+        if num_nodes <= 1:
+            return th.empty((2, 0), dtype=th.long, device=device)
+        
+        # 为单个图构建边索引（全连接，移除自连接）
+        # 使用meshgrid创建所有节点对
+        i, j = th.meshgrid(
+            th.arange(num_nodes, device=device),
+            th.arange(num_nodes, device=device),
+            indexing='ij'
+        )
+        # 移除自连接
+        mask = i != j
+        i, j = i[mask], j[mask]  # (V*(V-1),)
+        
+        # 单个图的边索引
+        single_graph_edges = th.stack([i, j], dim=0)  # (2, V*(V-1))
+        num_edges_per_graph = single_graph_edges.shape[1]
+        
+        # 为所有样本和时间步复制边（向量化）
+        total_graphs = num_samples * num_timesteps
+        total_edges = num_edges_per_graph * total_graphs
+        
+        # 创建节点偏移量
+        # 对于(n, t)，节点偏移 = (n * num_timesteps + t) * num_nodes
+        graph_indices = th.arange(total_graphs, device=device)  # (total_graphs,)
+        node_offsets = graph_indices * num_nodes  # (total_graphs,)
+        
+        # 扩展边索引（完全向量化，快速且可中断）
+        # single_graph_edges: (2, V*(V-1))
+        # node_offsets: (total_graphs,)
+        # 结果: (2, total_graphs * V*(V-1))
+        edge_src = (single_graph_edges[0].unsqueeze(0) + node_offsets.unsqueeze(1)).flatten()  # (total_edges,)
+        edge_dst = (single_graph_edges[1].unsqueeze(0) + node_offsets.unsqueeze(1)).flatten()  # (total_edges,)
+        
+        edge_index = th.stack([edge_src, edge_dst], dim=0)  # (2, total_edges)
+        
+        return edge_index
+    
+    def _build_adjacency_matrix(self, num_nodes, device):
+        """为SimpleGCNLayer构建邻接矩阵"""
+        # 全连接图（移除自连接）
+        adj = th.ones(num_nodes, num_nodes, device=device)
+        adj = adj - th.eye(num_nodes, device=device)
+        return adj
+    
+    def forward(self, x, data_key=None):
+        """
+        Args:
+            x: (B, C, T) - B是batch（可能包含变量信息），C是特征通道数，T是时间步
+            data_key: (B,) - 每个样本的数据集标识，用于查找对应的变量数
+        Returns:
+            x: (B, C, T) - 经过GNN处理后的特征
+        """
+        B, C, T = x.shape
+        
+        # 如果没有提供data_key或num_variables_dict，无法确定变量数，直接返回
+        if data_key is None or len(self.num_variables_dict) == 0:
+            return x
+        
+        # 根据data_key获取每个样本的变量数
+        # data_key是数据集索引（整数），对应num_variables_dict的键
+        # 注意：B可能包含变量信息，即 B = N * V（N是样本数，V是变量数）
+        # 我们需要根据data_key来确定每个样本的变量数
+        
+        # 获取第一个样本的data_key，假设batch中所有样本来自同一数据集
+        # 如果batch混合了不同数据集，需要更复杂的处理
+        if isinstance(data_key, torch.Tensor):
+            first_data_key = int(data_key[0].item())
+        else:
+            first_data_key = int(data_key[0]) if hasattr(data_key, '__getitem__') else 0
+        
+        # 从num_variables_dict中查找变量数（data_key是索引）
+        num_variables = self.num_variables_dict.get(first_data_key, 1)
+        
+        # 如果变量数为1，直接返回
+        if num_variables <= 1:
+            return x
+        
+        # 检查batch_size是否能被变量数整除
+        if B % num_variables != 0:
+            # 如果无法整除，说明batch中混合了不同数据集的样本，暂时跳过GNN
+            return x
+        
+        # 重新组织数据：将(B, C, T) -> (N, V, C, T)，其中N = B // V
+        N = B // num_variables
+        x_reshaped = x.view(N, num_variables, C, T)  # (N, V, C, T)
+        
+        # 对每个样本独立处理：将每个时间步的V个变量作为图的节点
+        # (N, V, C, T) -> (N*T, V, C) -> (N*T*V, C)
+        x_reshaped = x_reshaped.permute(0, 3, 1, 2).contiguous()  # (N, T, V, C)
+        x_reshaped = x_reshaped.view(N * T, num_variables, C)  # (N*T, V, C)
+        x_reshaped = x_reshaped.view(N * T * num_variables, C)  # (N*T*V, C)
+        
+        # 应用GNN层：对每个时间步的变量进行交互
+        h = x_reshaped
+        for i, gnn_layer in enumerate(self.gnn_layers):
+            if self.gnn_type == 'simple_gcn':
+                # SimpleGCNLayer需要邻接矩阵
+                adj = self._build_adjacency_matrix(num_variables, x.device)
+                # 对每个时间步独立处理
+                h_reshaped = h.view(N * T, num_variables, C)
+                h_list = []
+                for t_idx in range(N * T):
+                    h_t = h_reshaped[t_idx]  # (V, C)
+                    h_t = gnn_layer(h_t, adj=adj)  # (V, C)
+                    h_list.append(h_t)
+                h = th.stack(h_list, dim=0).view(N * T * num_variables, C)
+            else:
+                # PyTorch Geometric的层使用edge_index
+                # 为每个时间步构建独立的图
+                edge_index = self._build_edge_index(num_variables, N, T, x.device)
+                if edge_index.shape[1] == 0:
+                    h = x_reshaped
+                    break
+                h = gnn_layer(h, edge_index)
+            
+            # 最后一层不加激活函数，中间层加ReLU
+            if i < len(self.gnn_layers) - 1:
+                h = F.relu(h)
+        
+        # Reshape回: (N*T*V, C) -> (N, V, C, T) -> (B, C, T)
+        h = h.view(N * T, num_variables, C)
+        h = h.view(N, T, num_variables, C)
+        h = h.permute(0, 2, 3, 1).contiguous()  # (N, V, C, T)
+        h = h.view(B, C, T)  # (B, C, T)
+        
+        # 【必须加】残差连接，确保初始时GNN输出为0，不影响原始特征
+        # 由于最后一层已零初始化，训练初期h≈0，所以x+h≈x，不会破坏已有特征
+        return x + h
+
+
 class UNetModel(nn.Module):
     """
     The full UNet model with attention and timestep embedding.
@@ -442,7 +681,14 @@ class UNetModel(nn.Module):
         latent_unit=6,
         use_cfg=True,
         cond_drop_prob=0.5,
-        use_pam=False
+        use_pam=False,
+        # 新增GNN相关参数
+        use_gnn_in_unet=False,  # 是否在UNet中使用GNN
+        unet_gnn_type='gat',     # GNN类型
+        unet_gnn_layers=2,       # GNN层数
+        unet_gnn_hidden_dim=None, # GNN隐藏层维度
+        unet_gnn_heads=4,        # GAT的注意力头数
+        num_variables_dict=None,  # 变量数字典 {data_key: num_variables}
     ):
         super().__init__()
         # if use_spatial_transformer:
@@ -483,6 +729,13 @@ class UNetModel(nn.Module):
         self.latent_unit = latent_unit
         self.latent_dim = repre_emb_channels
         self.use_pam = use_pam
+        # GNN相关参数
+        self.use_gnn_in_unet = use_gnn_in_unet
+        self.unet_gnn_type = unet_gnn_type
+        self.unet_gnn_layers = unet_gnn_layers
+        self.unet_gnn_hidden_dim = unet_gnn_hidden_dim
+        self.unet_gnn_heads = unet_gnn_heads
+        self.num_variables_dict = num_variables_dict or {}
         
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -583,7 +836,9 @@ class UNetModel(nn.Module):
         if legacy:
             #num_heads = 1
             dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
-        self.middle_block = TimestepEmbedSequential(
+        
+        # 构建middle_block层列表
+        middle_block_layers = [
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -602,6 +857,24 @@ class UNetModel(nn.Module):
             ) if not use_spatial_transformer else Spatial1DTransformer(
                             ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, use_pam=self.use_pam
                         ),
+        ]
+        
+        # 在Bottleneck层添加GNN（在Attention之后，第二个ResBlock之前）
+        if self.use_gnn_in_unet:
+            middle_block_layers.append(
+                GNNBlock(
+                    ch,
+                    gnn_type=self.unet_gnn_type,
+                    gnn_layers=self.unet_gnn_layers,
+                    gnn_hidden_dim=self.unet_gnn_hidden_dim,
+                    num_heads=self.unet_gnn_heads,
+                    use_checkpoint=use_checkpoint,
+                    num_variables_dict=self.num_variables_dict
+                )
+            )
+            print(f"GNN added to UNet Bottleneck: type={self.unet_gnn_type}, layers={self.unet_gnn_layers}")
+        
+        middle_block_layers.append(
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -612,6 +885,8 @@ class UNetModel(nn.Module):
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
         )
+        
+        self.middle_block = TimestepEmbedSequential(*middle_block_layers)
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
@@ -694,7 +969,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def _forward(self, x, timesteps=None, context=None, mask=None, y=None, cond_drop_prob=0, **kwargs):
+    def _forward(self, x, timesteps=None, context=None, mask=None, y=None, cond_drop_prob=0, data_key=None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -733,15 +1008,15 @@ class UNetModel(nn.Module):
         h = x.type(self.dtype)
         k = 0
         for module in self.input_blocks:
-            h = module(h, emb, context_emb, mask=mask)
+            h = module(h, emb, context_emb, mask=mask, data_key=data_key)
             hs.append(h)
             if k == 5:
                 a = 1
             k += 1
-        h = self.middle_block(h, emb, context_emb, mask=mask)
+        h = self.middle_block(h, emb, context_emb, mask=mask, data_key=data_key)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context_emb, mask=mask)
+            h = module(h, emb, context_emb, mask=mask, data_key=data_key)
         h = h.type(x.dtype)
         pred = self.out(h)
         return Return(pred = pred)

@@ -48,6 +48,12 @@ model:
         latent_unit: 1
         use_spatial_transformer: true
         use_pam: true
+        # UNet Bottleneck GNN相关参数（可选）
+        use_gnn_in_unet: false  # 是否在UNet Bottleneck中使用GNN
+        unet_gnn_type: gat      # GNN类型: 'simple_gcn', 'gcn', 'gat', 'gatv2'
+        unet_gnn_layers: 2       # GNN层数
+        unet_gnn_hidden_dim: null  # GNN隐藏层维度，null则使用channels
+        unet_gnn_heads: 4        # GAT的注意力头数
 
     first_stage_config:  # no first stage model for ts data
       target: ldm.models.autoencoder.IdentityFirstStage 
@@ -65,7 +71,7 @@ model:
         num_variables: null  # 变量数，如果为null则从数据推断或禁用GNN
         gnn_layers: 2  # GNN层数
         gnn_hidden_dim: null  # GNN隐藏层维度，null则使用num_latents
-        gnn_type: simple_gcn  # GNN类型: 'simple_gcn', 'gcn', 'gat'
+        gnn_type: simple_gcn  # GNN类型: 'simple_gcn', 'gcn', 'gat', 'gatv2'
 
 data:
   target: ldm.data.tsg_dataset.TSGDataModule

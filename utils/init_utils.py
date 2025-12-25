@@ -13,8 +13,9 @@ from ldm.util import instantiate_from_config
 from pathlib import Path
 import datetime
 from utils.cli_utils import nondefault_trainer_args
+from utils.data_utils import get_data_root
 
-data_root = os.environ['DATA_ROOT']
+data_root = str(get_data_root())
 
 def init_model_data_trainer(parser):
     
@@ -79,7 +80,7 @@ def init_model_data_trainer(parser):
             config.model['params']['unet_config']['params']['latent_unit'] = opt.num_latents
             config.model['params']['unet_config']['params']['use_pam'] = True
             
-            # GNN相关参数
+            # PAM GNN相关参数
             if hasattr(opt, 'use_gnn') and opt.use_gnn:
                 config.model['params']['cond_stage_config']['params']['use_gnn'] = True
                 if hasattr(opt, 'num_variables') and opt.num_variables is not None:
@@ -93,7 +94,23 @@ def init_model_data_trainer(parser):
                 config.model['params']['cond_stage_config']['params']['use_gnn'] = False
             
             nowname += f"_pam"
+        
+        # UNet Bottleneck GNN相关参数
+        if hasattr(opt, 'use_gnn_in_unet') and opt.use_gnn_in_unet:
+            config.model['params']['unet_config']['params']['use_gnn_in_unet'] = True
+            if hasattr(opt, 'unet_gnn_type'):
+                config.model['params']['unet_config']['params']['unet_gnn_type'] = opt.unet_gnn_type
+            if hasattr(opt, 'unet_gnn_layers'):
+                config.model['params']['unet_config']['params']['unet_gnn_layers'] = opt.unet_gnn_layers
+            if hasattr(opt, 'unet_gnn_hidden_dim'):
+                config.model['params']['unet_config']['params']['unet_gnn_hidden_dim'] = opt.unet_gnn_hidden_dim
+            if hasattr(opt, 'unet_gnn_heads'):
+                config.model['params']['unet_config']['params']['unet_gnn_heads'] = opt.unet_gnn_heads
+            nowname += f"_unetgnn{opt.unet_gnn_type}"
         else:
+            config.model['params']['unet_config']['params']['use_gnn_in_unet'] = False
+        
+        if not opt.use_pam:
             config.model['params']['cond_stage_config']['target'] = "ldm.modules.encoders.modules.DomainUnifiedEncoder"
             config.model['params']['unet_config']['params']['use_pam'] = False
             
@@ -222,18 +239,19 @@ def init_model_data_trainer(parser):
         if k not in trainer_kwargs:
             trainer_kwargs[k] = v
     
-    # 直接使用 Trainer(**trainer_kwargs) 创建，避免 from_argparse_args 的 bug
-    trainer = Trainer(**trainer_kwargs)
-    trainer.logdir = logdir  ###
-    
-    # 如果指定了恢复训练，设置 resume_from_checkpoint（PyTorch Lightning 1.4.2 的方式）
+    # 如果指定了恢复训练，在创建Trainer之前设置resume_from_checkpoint
+    # 注意：resume_from_checkpoint 必须在创建 Trainer 时作为参数传入，不能之后设置
     if opt.resume:
         ckpt_path = os.path.join(logdir, "checkpoints", "last.ckpt")
         if os.path.exists(ckpt_path):
-            trainer.resume_from_checkpoint = ckpt_path
-            print(f"Trainer configured to resume from checkpoint: {ckpt_path}")
+            trainer_kwargs['resume_from_checkpoint'] = ckpt_path
+            print(f"Trainer will resume from checkpoint: {ckpt_path}")
         else:
             print(f"Warning: Checkpoint not found at {ckpt_path}, will start from scratch")
+    
+    # 直接使用 Trainer(**trainer_kwargs) 创建，避免 from_argparse_args 的 bug
+    trainer = Trainer(**trainer_kwargs)
+    trainer.logdir = logdir  ###
 
     # data
     for k, v in config.data.params.data_path_dict.items():
@@ -264,7 +282,7 @@ def init_model_data_trainer(parser):
         "Assertion failed: Only univariate input is supported. Please ensure input_channels == 1."
     print("#### Data Preparation Finished #####")
     
-    # 将数据集的变量数信息传递给模型（用于GNN）
+    # 将数据集的变量数信息传递给模型（用于GNN和UNet GNN）
     if hasattr(data, 'num_variables_dict') and data.num_variables_dict:
         # 将数据集名称映射转换为索引映射（data_key是索引）
         # data.key_list 是数据集名称列表，索引对应data_key
@@ -275,6 +293,10 @@ def init_model_data_trainer(parser):
         if model_num_variables_dict:
             model.num_variables_dict = model_num_variables_dict
             print(f"Model num_variables_dict: {model_num_variables_dict}")
+            
+            # 将变量数字典传递给UNet配置（用于UNet GNN）
+            if hasattr(opt, 'use_gnn_in_unet') and opt.use_gnn_in_unet:
+                config.model['params']['unet_config']['params']['num_variables_dict'] = model_num_variables_dict
     if not cpu:
         ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
     else:
@@ -396,8 +418,21 @@ def load_model_data(parser):
         else:
             config.model['params']['cond_stage_config']['target'] = "ldm.modules.encoders.modules.DomainUnifiedEncoder"
             config.model['params']['unet_config']['params']['use_pam'] = False
-            
-            
+        
+        # UNet Bottleneck GNN相关参数（load_model_data函数中也需要）
+        if hasattr(opt, 'use_gnn_in_unet') and opt.use_gnn_in_unet:
+            config.model['params']['unet_config']['params']['use_gnn_in_unet'] = True
+            if hasattr(opt, 'unet_gnn_type'):
+                config.model['params']['unet_config']['params']['unet_gnn_type'] = opt.unet_gnn_type
+            if hasattr(opt, 'unet_gnn_layers'):
+                config.model['params']['unet_config']['params']['unet_gnn_layers'] = opt.unet_gnn_layers
+            if hasattr(opt, 'unet_gnn_hidden_dim'):
+                config.model['params']['unet_config']['params']['unet_gnn_hidden_dim'] = opt.unet_gnn_hidden_dim
+            if hasattr(opt, 'unet_gnn_heads'):
+                config.model['params']['unet_config']['params']['unet_gnn_heads'] = opt.unet_gnn_heads
+            nowname += f"_unetgnn{opt.unet_gnn_type}"
+        else:
+            config.model['params']['unet_config']['params']['use_gnn_in_unet'] = False
     
     nowname += f"_seed{opt.seed}"
     logdir = os.path.join(opt.logdir, cfg_name, nowname)

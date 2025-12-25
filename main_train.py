@@ -18,8 +18,8 @@ from utils.test_utils import test_model_with_dp, test_model_uncond, test_model_u
 
 
 if __name__ == "__main__":
-    
-    data_root = os.environ['DATA_ROOT']
+    from utils.data_utils import get_data_root
+    data_root = str(get_data_root())
 
     parser = get_parser()
     parser = Trainer.add_argparse_args(parser)

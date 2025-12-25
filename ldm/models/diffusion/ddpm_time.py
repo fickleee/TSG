@@ -424,6 +424,9 @@ class LatentDiffusion(DDPM):
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
+        
+        # 存储num_variables_dict，用于UNet GNN
+        self.num_variables_dict = None
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -629,7 +632,7 @@ class LatentDiffusion(DDPM):
         return self.p_losses(x, c, t, *args, **kwargs)
 
     def apply_model(self, x_noisy, t, cond, mask, cfg_scale=1, cond_drop_prob=None, 
-                    sampled_concept= None, sampled_index= None, sub_scale=None, **kwargs):
+                    sampled_concept= None, sampled_index= None, sub_scale=None, data_key=None, **kwargs):
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
@@ -639,6 +642,10 @@ class LatentDiffusion(DDPM):
                 cond = [cond]
             key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
             cond = {key: cond, 'mask': mask}
+        
+        # 将data_key传递到UNet
+        if data_key is not None:
+            cond['data_key'] = data_key
         
         if cond_drop_prob is None:
             x_recon = self.model.cfg_forward(x_noisy, t, cfg_scale=cfg_scale, sampled_concept = sampled_concept, sampled_index = sampled_index, sub_scale = sub_scale, **cond)
@@ -661,7 +668,7 @@ class LatentDiffusion(DDPM):
             mask = None
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        model_output = self.apply_model(x_noisy, t, cond, mask, cond_drop_prob=self.cond_drop_prob)
+        model_output = self.apply_model(x_noisy, t, cond, mask, cond_drop_prob=self.cond_drop_prob, data_key=data_key)
 
         eps_pred = return_wrap(model_output, extract_into_tensor(self.shift_coef, t, x_start.shape))
 
@@ -948,13 +955,13 @@ class DiffusionWrapper(pl.LightningModule):
     def parameters(self):
         return self.diffusion_model.parameters()
 
-    def forward(self, x, t, c_crossattn: list = None, cond_drop_prob = 0., mask=None, **kwargs):
+    def forward(self, x, t, c_crossattn: list = None, cond_drop_prob = 0., mask=None, data_key=None, **kwargs):
         
         if (c_crossattn is not None) and (not None in c_crossattn):
             cc = torch.cat(c_crossattn, 1)
         else:
             cc = None
-        out = self.diffusion_model(x, t, context=cc, mask=mask, cond_drop_prob=cond_drop_prob)
+        out = self.diffusion_model(x, t, context=cc, mask=mask, cond_drop_prob=cond_drop_prob, data_key=data_key)
         
         return out
         
