@@ -32,4 +32,10 @@ dependencies:
   - mkl=2023
   - pytorch-lightning=1.4.2
   - torchmetrics=0.7.3
+  - pip
+  - pip:
+    - torch-geometric
+    - torch-scatter
+    - torch-sparse
+    - torch-cluster
 prefix: /opt/conda/envs/tsgen

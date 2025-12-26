@@ -56,70 +56,102 @@ def format_metrics_to_table(metrics_dict):
     df = df.sort_values(['Dataset', 'Seq_Len'])
     return df
 
-def print_table(df):
+def print_table(df, show_stats=True):
     """在终端打印格式化的表格"""
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', None)
     pd.set_option('display.max_colwidth', None)
     pd.set_option('display.float_format', lambda x: f'{x:.6f}' if not pd.isna(x) else 'N/A')
-    
+
     print("\n" + "="*90)
     print("评估指标结果表格")
     print("="*90)
     print(df.to_string(index=False))
     print("="*90)
-    
-    # 打印统计信息
-    print(f"\n数据集数量: {df['Dataset'].nunique()}")
-    print(f"各指标平均值:")
-    print(f"  MDD:      {df['MDD'].mean():.6f}")
-    print(f"  Flat_KL:  {df['Flat_KL'].mean():.6f}")
-    print(f"  MMD_RBF:  {df['MMD_RBF'].mean():.6f}")
-    print("="*90 + "\n")
 
-def find_latest_metric_file():
-    """查找最新的metric_dict.pkl文件"""
+    if show_stats:
+        # 打印统计信息
+        print(f"\n数据集数量: {df['Dataset'].nunique()}")
+        print(f"各指标平均值:")
+        print(f"  MDD:      {df['MDD'].mean():.6f}")
+        print(f"  Flat_KL:  {df['Flat_KL'].mean():.6f}")
+        print(f"  MMD_RBF:  {df['MMD_RBF'].mean():.6f}")
+        print("="*90 + "\n")
+
+def find_all_metric_files():
+    """查找所有metric_dict.pkl文件"""
     log_dirs = [
         Path('./logs'),
         Path('../logs'),
     ]
-    
+
     metric_files = []
     for log_dir in log_dirs:
         if log_dir.exists():
             metric_files.extend(log_dir.rglob('metric_dict.pkl'))
-    
-    if not metric_files:
-        return None
-    
-    # 返回最新的文件（按修改时间）
-    return max(metric_files, key=lambda p: p.stat().st_mtime)
+
+    return metric_files
+
+def process_metric_file(metric_path):
+    """处理单个metric文件"""
+    csv_path = metric_path.parent / f"{metric_path.stem}_table.csv"
+
+    # 检查是否已经存在CSV文件
+    if csv_path.exists():
+        print(f"跳过: {metric_path.name} (CSV已存在: {csv_path.name})")
+        return
+
+    try:
+        print(f"处理: {metric_path}")
+        metrics_dict = load_pkl(metric_path)
+        df = format_metrics_to_table(metrics_dict)
+
+        # 保存为CSV
+        df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        print(f"✓ 已保存: {csv_path}")
+
+        # 显示表格（批量处理时不显示统计信息）
+        print_table(df, show_stats=False)
+
+    except Exception as e:
+        print(f"✗ 处理失败 {metric_path}: {e}")
 
 def main():
     if len(sys.argv) > 1:
+        # 如果提供了特定路径，只处理该文件
         metric_path = Path(sys.argv[1])
         if not metric_path.exists():
             print(f"错误: 文件不存在: {metric_path}")
             sys.exit(1)
+        process_metric_file(metric_path)
     else:
-        metric_path = find_latest_metric_file()
-        if not metric_path:
-            print("错误: 未找到metric_dict.pkl文件")
-            print("请提供文件路径: python utils/show_metrics.py <path_to_metric_dict.pkl>")
+        # 遍历所有metric文件
+        metric_files = find_all_metric_files()
+        if not metric_files:
+            print("错误: 未找到任何metric_dict.pkl文件")
             sys.exit(1)
-        print(f"自动找到指标文件: {metric_path}")
-    
-    # 加载并显示
-    metrics_dict = load_pkl(metric_path)
-    df = format_metrics_to_table(metrics_dict)
-    print_table(df)
-    
-    # 询问是否保存
-    save_csv = input("是否保存为CSV文件? (y/n): ").strip().lower()
-    if save_csv == 'y':
-        csv_path = metric_path.parent / f"{metric_path.stem}_table.csv"
-        df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-        print(f"已保存: {csv_path}")
+
+        print(f"找到 {len(metric_files)} 个metric_dict.pkl文件")
+        print()
+
+        processed_count = 0
+        skipped_count = 0
+
+        for metric_path in metric_files:
+            csv_path = metric_path.parent / f"{metric_path.stem}_table.csv"
+            if csv_path.exists():
+                print(f"跳过: {metric_path.name} (CSV已存在)")
+                skipped_count += 1
+            else:
+                process_metric_file(metric_path)
+                processed_count += 1
+                print()  # 空行分隔
+
+        print("="*50)
+        print(f"处理完成:")
+        print(f"  新处理: {processed_count} 个")
+        print(f"  跳过: {skipped_count} 个")
+        print(f"  总计: {len(metric_files)} 个")
 
 if __name__ == '__main__':
     main()
