@@ -9,19 +9,36 @@ from datetime import datetime
 from pathlib import Path
 import os
 
-def get_data_root():
+# 缓存数据根目录，避免重复计算和打印
+_data_root_cache = None
+_data_root_printed = False
+
+def get_data_root(verbose=True):
     """
     获取数据根目录路径（统一函数，可在所有模块中导入使用）
     优先级：
     1. 环境变量 DATA_ROOT（如果设置且存在）
     2. 项目根目录下的 dataset 文件夹（默认）
     
+    Args:
+        verbose: 是否打印信息（默认True，但只打印一次）
+    
     Returns:
         Path: 数据根目录的Path对象
     """
+    global _data_root_cache, _data_root_printed
+    
+    # 如果已经缓存，直接返回（不重复打印）
+    if _data_root_cache is not None:
+        return _data_root_cache
+    
     # 首先检查环境变量
     if 'DATA_ROOT' in os.environ and os.path.exists(os.environ['DATA_ROOT']):
-        return Path(os.environ['DATA_ROOT'])
+        _data_root_cache = Path(os.environ['DATA_ROOT'])
+        if verbose and not _data_root_printed:
+            print(f"使用环境变量数据目录: {_data_root_cache}")
+            _data_root_printed = True
+        return _data_root_cache
     
     # 如果没有设置环境变量，使用项目根目录下的dataset文件夹
     # 获取当前文件的目录，向上找到项目根目录
@@ -30,15 +47,20 @@ def get_data_root():
     project_root = current_file.parent.parent
     default_data_root = project_root / 'dataset'
     
-    if default_data_root.exists():
-        print(f"使用默认数据目录: {default_data_root}")
-        return default_data_root
-    else:
-        print(f"警告: 默认数据目录不存在: {default_data_root}")
-        print("请设置 DATA_ROOT 环境变量或确保 dataset 文件夹存在")
-        return default_data_root  # 仍然返回，让后续代码处理错误
+    _data_root_cache = default_data_root
+    
+    if verbose and not _data_root_printed:
+        if default_data_root.exists():
+            print(f"使用默认数据目录: {default_data_root}")
+        else:
+            print(f"警告: 默认数据目录不存在: {default_data_root}")
+            print("请设置 DATA_ROOT 环境变量或确保 dataset 文件夹存在")
+        _data_root_printed = True
+    
+    return _data_root_cache
 
-prefix = get_data_root()
+# 模块级别初始化 prefix，但只打印一次（通过缓存机制）
+prefix = get_data_root(verbose=True)
 
 test_data_map = {
     'solar': 'solar_{seq_len}_val.npy',

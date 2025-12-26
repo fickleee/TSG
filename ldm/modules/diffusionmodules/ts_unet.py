@@ -394,13 +394,29 @@ class GNNBlock(nn.Module):
     """
     def __init__(self, channels, gnn_type='gat', gnn_layers=2, 
                  gnn_hidden_dim=None, num_heads=4, use_checkpoint=False,
-                 num_variables_dict=None):
+                 num_variables_dict=None, use_gate=True):
         super().__init__()
         self.channels = channels
         self.gnn_type = gnn_type
         self.use_checkpoint = use_checkpoint
         self.num_variables_dict = num_variables_dict or {}  # {data_key: num_variables}
         gnn_hidden_dim = gnn_hidden_dim or channels
+        
+        # 【第一剂：必做】输入归一化层，解决特征分布不匹配问题
+        self.input_norm = nn.LayerNorm(channels)
+        
+        # 【第二剂：必做】Learnable Gate，让UNet有拒绝GNN输出的权利
+        if use_gate:
+            self.gate = nn.Sequential(
+                nn.AdaptiveAvgPool1d(1),  # (B, C, T) -> (B, C, 1)
+                nn.Conv1d(channels, channels, 1),
+                nn.Sigmoid()
+            )
+            # 初始化门控，让初始时倾向于不使用GNN（sigmoid(-2) ≈ 0.12）
+            nn.init.zeros_(self.gate[1].weight)
+            nn.init.constant_(self.gate[1].bias, -2.0)
+        else:
+            self.gate = None
         
         # 初始化GNN层（复用PAM中的实现逻辑）
         if gnn_type == 'simple_gcn':
@@ -584,8 +600,11 @@ class GNNBlock(nn.Module):
         x_reshaped = x_reshaped.view(N * T, num_variables, C)  # (N*T, V, C)
         x_reshaped = x_reshaped.view(N * T * num_variables, C)  # (N*T*V, C)
         
+        # 【第一剂：必做】输入归一化，解决特征分布不匹配问题
+        x_reshaped_norm = self.input_norm(x_reshaped)  # (N*T*V, C)
+        
         # 应用GNN层：对每个时间步的变量进行交互
-        h = x_reshaped
+        h = x_reshaped_norm
         for i, gnn_layer in enumerate(self.gnn_layers):
             if self.gnn_type == 'simple_gcn':
                 # SimpleGCNLayer需要邻接矩阵
@@ -603,12 +622,17 @@ class GNNBlock(nn.Module):
                 # 为每个时间步构建独立的图
                 edge_index = self._build_edge_index(num_variables, N, T, x.device)
                 if edge_index.shape[1] == 0:
-                    h = x_reshaped
+                    # 如果无法构建边，直接返回原始输入（跳过GNN）
+                    h = x_reshaped_norm
                     break
                 h = gnn_layer(h, edge_index)
             
-            # 最后一层不加激活函数，中间层加ReLU
+            # 在中间层之间添加LayerNorm和激活函数
             if i < len(self.gnn_layers) - 1:
+                # 对每个时间步的变量特征进行LayerNorm
+                h_reshaped = h.view(N * T, num_variables, C)
+                h_reshaped = F.layer_norm(h_reshaped, (C,))
+                h = h_reshaped.view(N * T * num_variables, C)
                 h = F.relu(h)
         
         # Reshape回: (N*T*V, C) -> (N, V, C, T) -> (B, C, T)
@@ -617,9 +641,14 @@ class GNNBlock(nn.Module):
         h = h.permute(0, 2, 3, 1).contiguous()  # (N, V, C, T)
         h = h.view(B, C, T)  # (B, C, T)
         
-        # 【必须加】残差连接，确保初始时GNN输出为0，不影响原始特征
-        # 由于最后一层已零初始化，训练初期h≈0，所以x+h≈x，不会破坏已有特征
-        return x + h
+        # 【第二剂：必做】Learnable Gate，让UNet有拒绝GNN输出的权利
+        # 由于最后一层已零初始化，训练初期h≈0，gate也会倾向于0，所以x+gate*h≈x
+        if self.gate is not None:
+            gate_weight = self.gate(x)  # (B, C, 1)
+            return x + gate_weight * h
+        else:
+            # 如果没有gate，使用简单的残差连接
+            return x + h
 
 
 class UNetModel(nn.Module):
