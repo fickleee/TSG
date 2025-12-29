@@ -394,7 +394,7 @@ class GNNBlock(nn.Module):
     """
     def __init__(self, channels, gnn_type='gat', gnn_layers=2, 
                  gnn_hidden_dim=None, num_heads=4, use_checkpoint=False,
-                 num_variables_dict=None, use_gate=True):
+                 num_variables_dict=None, use_gate=True, use_node_identity=True):
         super().__init__()
         self.channels = channels
         self.gnn_type = gnn_type
@@ -417,6 +417,19 @@ class GNNBlock(nn.Module):
             nn.init.constant_(self.gate[1].bias, -2.0)
         else:
             self.gate = None
+        
+        # 【第三剂：检查】Node Identity，为每个变量提供唯一标识
+        # 让GNN能够区分不同的变量节点，避免"瞎猜"
+        if use_node_identity:
+            # 计算最大变量数（用于初始化嵌入表大小）
+            max_variables = max(self.num_variables_dict.values()) if self.num_variables_dict else 10
+            # 为了安全，设置一个合理的上限（通常变量数不会超过50）
+            max_variables = min(max_variables, 50)
+            self.node_embedding = nn.Embedding(max_variables, channels)
+            # 使用小的初始化，避免干扰原始特征
+            nn.init.normal_(self.node_embedding.weight, mean=0.0, std=0.02)
+        else:
+            self.node_embedding = None
         
         # 初始化GNN层（复用PAM中的实现逻辑）
         if gnn_type == 'simple_gcn':
@@ -603,8 +616,33 @@ class GNNBlock(nn.Module):
         # 【第一剂：必做】输入归一化，解决特征分布不匹配问题
         x_reshaped_norm = self.input_norm(x_reshaped)  # (N*T*V, C)
         
+        # 【第三剂：检查】Node Identity，为每个变量提供唯一标识
+        # 让GNN能够区分不同的变量节点，避免"瞎猜"
+        if self.node_embedding is not None:
+            # 创建节点ID：每个变量有唯一的ID (0, 1, 2, ..., V-1)
+            # 确保不超过嵌入表大小
+            max_emb_size = self.node_embedding.num_embeddings
+            num_vars_to_use = min(num_variables, max_emb_size)
+            node_ids = torch.arange(num_vars_to_use, device=x.device, dtype=torch.long)  # (V',)
+            # 获取节点嵌入
+            node_emb = self.node_embedding(node_ids)  # (V', C)
+            # 如果变量数超过嵌入表大小，对多余的变量使用最后一个嵌入
+            if num_variables > max_emb_size:
+                # 为多余的变量重复最后一个嵌入
+                extra_emb = node_emb[-1:].repeat(num_variables - max_emb_size, 1)  # (V-V', C)
+                node_emb = torch.cat([node_emb, extra_emb], dim=0)  # (V, C)
+            # 为每个时间步和样本复制节点嵌入
+            # (V, C) -> (1, V, C) -> (N*T, V, C) -> (N*T*V, C)
+            node_emb = node_emb.unsqueeze(0)  # (1, V, C)
+            node_emb = node_emb.repeat(N * T, 1, 1)  # (N*T, V, C)
+            node_emb = node_emb.reshape(N * T * num_variables, C)  # (N*T*V, C)
+            # 将节点嵌入加到归一化后的特征上
+            x_reshaped_with_id = x_reshaped_norm + node_emb
+        else:
+            x_reshaped_with_id = x_reshaped_norm
+        
         # 应用GNN层：对每个时间步的变量进行交互
-        h = x_reshaped_norm
+        h = x_reshaped_with_id
         for i, gnn_layer in enumerate(self.gnn_layers):
             if self.gnn_type == 'simple_gcn':
                 # SimpleGCNLayer需要邻接矩阵
@@ -623,7 +661,7 @@ class GNNBlock(nn.Module):
                 edge_index = self._build_edge_index(num_variables, N, T, x.device)
                 if edge_index.shape[1] == 0:
                     # 如果无法构建边，直接返回原始输入（跳过GNN）
-                    h = x_reshaped_norm
+                    h = x_reshaped_with_id
                     break
                 h = gnn_layer(h, edge_index)
             
